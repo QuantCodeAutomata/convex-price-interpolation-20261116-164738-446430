@@ -1,0 +1,21 @@
+{
+  "data_source_used": "synthetic SSVI surface",
+  "slice_label": "PM_D175",
+  "T_years": 0.47932838660578386,
+  "n_body_quotes": 258,
+  "cubic": {
+    "frac_in_spread": 1.0,
+    "rmse_vs_mid_bps": 1.5652351014540473,
+    "n_in_spread": 258
+  },
+  "quartic": {
+    "frac_in_spread": 1.0,
+    "rmse_vs_mid_bps": 1.274598552069866,
+    "n_in_spread": 258
+  },
+  "cross_degree_rmse_bps": 1.09845413849565,
+  "cross_degree_max_bps": 6.3656852225563165,
+  "density_peak_cubic": 4.692366548336061,
+  "density_peak_quartic": 4.484576436552874,
+  "density_relative_disagreement_fraction_of_peak": 0.050490509174070275
+}
