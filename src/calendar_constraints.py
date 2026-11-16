@@ -178,6 +178,30 @@ def sandwich_rows(
     return rows
 
 
+def pointwise_calendar_rows(
+    piece_n: SlicePieces, piece_m: SlicePieces, grid_k: np.ndarray,
+) -> list[dict]:
+    """Return linear-row dicts for pointwise ``c_m(x) - c_n(x) >= 0`` at the
+    log-moneyness grid ``grid_k``.
+
+    Used as a cover of body-wing bands (where the sandwich of Appendix C is
+    restricted to the body intersection) and as a dense safety net alongside
+    Appendix A tail-sum rows. Each row dict has the same shape as
+    ``sandwich_rows`` output and can be consumed by the same assembly code.
+    """
+    rows: list[dict] = []
+    for k in grid_k:
+        x = float(np.exp(k))
+        vn = _value_row(piece_n, x)
+        vm = _value_row(piece_m, x)
+        rows.append({
+            "Bd_m": vm["Bd"], "Pa_m": vm["Pa"], "Ca_m": vm["Ca"],
+            "Bd_n": vn["Bd"], "Pa_n": vn["Pa"], "Ca_n": vn["Ca"],
+            "rhs": vn["const"] - vm["const"],
+        })
+    return rows
+
+
 # -- Appendix A tail-sum constraints (pure wing beyond both seams) ----------
 
 

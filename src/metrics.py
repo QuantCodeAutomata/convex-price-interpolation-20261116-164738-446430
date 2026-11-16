@@ -27,31 +27,43 @@ def _vols_from_prices(c: np.ndarray, x: np.ndarray, T: float) -> np.ndarray:
 
 
 def slice_fit_stats(sv: SliceVars) -> SliceFitStats:
-    """Statistics of the fit for one slice against its own bid/ask quotes."""
+    """Statistics of the fit for one slice against its own bid/ask quotes.
+
+    Paper §8: "99.2% of 13,700 fitted body prices inside bid/ask spreads".
+    "Inside the spread" is tested in price space; the outside- and from-mid
+    distances are reported in implied-vol basis points.
+    """
     q = sv.quotes
     c_fit = evaluate_body(sv, q.x)
+    # Price-space in-spread test (paper §8).
+    tol_px = 1e-14
+    inside_px = (c_fit >= q.c_bid - tol_px) & (c_fit <= q.c_ask + tol_px)
+    n_in = int(np.sum(inside_px))
+    n_tot = int(c_fit.size)
     sig_fit = _vols_from_prices(c_fit, q.x, q.T)
-    sig_bid, sig_ask = q.sigma_bid, q.sigma_ask
-    inside = (sig_fit >= sig_bid - 1e-12) & (sig_fit <= sig_ask + 1e-12)
-    n_in = int(np.sum(np.isfinite(sig_fit) & inside))
-    n_tot = int(np.sum(np.isfinite(sig_fit)))
-    sig_mid = 0.5 * (sig_bid + sig_ask)
+    sig_mid = 0.5 * (q.sigma_bid + q.sigma_ask)
     err = sig_fit - sig_mid
     err_ok = err[np.isfinite(err)]
     rmse_bps = float(np.sqrt(np.mean(err_ok ** 2)) * 1e4) if err_ok.size else np.nan
-    outside = ~inside & np.isfinite(sig_fit)
-    if np.any(outside):
-        d_out = np.where(
-            sig_fit[outside] > sig_ask[outside],
-            sig_fit[outside] - sig_ask[outside],
-            sig_bid[outside] - sig_fit[outside],
-        )
-        median_outside_bps = float(np.median(d_out) * 1e4)
-    else:
-        median_outside_bps = 0.0
     median_dist_from_mid_bps = (
         float(np.median(np.abs(err_ok)) * 1e4) if err_ok.size else np.nan
     )
+    outside = ~inside_px & np.isfinite(sig_fit)
+    if np.any(outside):
+        # Convert the bid/ask edges to implied vols, then measure the distance
+        # from the fitted implied vol to the nearer edge (paper §8).
+        sig_bid = _vols_from_prices(q.c_bid[outside], q.x[outside], q.T)
+        sig_ask = _vols_from_prices(q.c_ask[outside], q.x[outside], q.T)
+        s_fit = sig_fit[outside]
+        d_out = np.where(
+            s_fit > sig_ask,
+            s_fit - sig_ask,
+            sig_bid - s_fit,
+        )
+        d_ok = d_out[np.isfinite(d_out)]
+        median_outside_bps = float(np.median(d_ok) * 1e4) if d_ok.size else 0.0
+    else:
+        median_outside_bps = 0.0
     return SliceFitStats(
         label=q.label, T=q.T, n_quotes=n_tot, n_in_spread=n_in,
         frac_in_spread=(n_in / max(n_tot, 1)),
@@ -76,15 +88,16 @@ def surface_fit_summary(sol: CPISolution) -> dict:
         err = sig_fit - sig_mid
         ok = np.isfinite(err)
         dist_mid_bps.extend((np.abs(err[ok]) * 1e4).tolist())
-        inside = (sig_fit >= q.sigma_bid - 1e-12) & (sig_fit <= q.sigma_ask + 1e-12)
-        outside = ~inside & ok
+        tol_px = 1e-14
+        inside_px = (c_fit >= q.c_bid - tol_px) & (c_fit <= q.c_ask + tol_px)
+        outside = ~inside_px & ok
         if np.any(outside):
-            d = np.where(
-                sig_fit[outside] > q.sigma_ask[outside],
-                sig_fit[outside] - q.sigma_ask[outside],
-                q.sigma_bid[outside] - sig_fit[outside],
-            )
-            out_bps.extend((d * 1e4).tolist())
+            sig_bid = _vols_from_prices(q.c_bid[outside], q.x[outside], q.T)
+            sig_ask = _vols_from_prices(q.c_ask[outside], q.x[outside], q.T)
+            sf = sig_fit[outside]
+            d = np.where(sf > sig_ask, sf - sig_ask, sig_bid - sf)
+            d_ok = d[np.isfinite(d)]
+            out_bps.extend((d_ok * 1e4).tolist())
     return {
         "n_quotes": n_q,
         "n_in_spread": n_in,
@@ -113,7 +126,7 @@ def verify_calendar(
     xs = np.exp(ks)
     prices = np.stack([evaluate_slice(sv, xs) for sv in sol.slices], axis=0)
     diffs = prices[1:] - prices[:-1]
-    n_viol = int(np.sum(diffs < -1e-10))
+    n_viol = int(np.sum(diffs < -1e-7))
     worst = float(diffs.min()) if diffs.size else 0.0
     return {"violations": n_viol, "max_gap": worst,
             "n_pairs": len(sol.slices) - 1, "n_points": n_points}

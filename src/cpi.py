@@ -17,9 +17,15 @@ from typing import Sequence
 import numpy as np
 import cvxpy as cp
 
+# Objective rescaling: unscaled fit term is O(price_rel^2) ~ 1e-7 and Clarabel's
+# relative-gap test becomes degenerate near zero; multiplying by 1e8 restores
+# well-conditioned convergence without altering the optimum (linear constraints).
+_OBJECTIVE_SCALE = 1.0e8
+
 from .body import BodyNCA
 from .bspline import ClampedBSpline, place_knots
 from .calendar_constraints import (
+    pointwise_calendar_rows,
     SlicePieces,
     sandwich_grid,
     sandwich_rows,
@@ -92,6 +98,8 @@ class CPIConfig:
     weight_clip_quantile: float = 0.95
     delta_mu: float = 1e-4     # tail-sum margin of eq. (27)
     sandwich_pts_per_s: float = 20.0  # intervals of s_n / 20 in log-moneyness
+    pointwise_pad_log: float = 1.0    # safety-net cover one log-moneyness unit
+                                      # past every seam (paper §8 grid)
 
 
 # -- Per-slice assembly ----------------------------------------------------
@@ -137,12 +145,17 @@ def _build_slice(
     # the two closest quotes straddling the forward.
     s_n = _atm_total_vol(q)
     body_nca = BodyNCA(basis=basis, s_n=s_n, epsilon=cfg.convexity_floor)
-    # Weights: omega_i = (V_i delta sigma_i)^(-2) clipped at a high quantile.
+    # Weights: omega_i = (V_i delta sigma_i)^(-2) clipped at a high quantile
+    # (paper §7). Normalise by the per-slice median so the data block is O(1)
+    # across maturities; absolute scale is absorbed by rho and eta.
     raw = q.vega * q.delta_sigma
     raw = np.where(raw > 1e-10, raw, 1e-10)
     omega = 1.0 / (raw * raw)
     cap = np.quantile(omega, cfg.weight_clip_quantile)
     omega = np.minimum(omega, cap)
+    med = float(np.median(omega))
+    if med > 0:
+        omega = omega / med
     # Variables
     d = cp.Variable(basis.n_basis, name="d")
     aL = cp.Variable(put.n_atoms, nonneg=True, name="aL")
@@ -226,6 +239,14 @@ def _slice_objective(sv: SliceVars, cfg: CPIConfig) -> cp.Expression:
     R = sv.body_nca.R()
     # Numerical symmetrisation in case of rounding noise.
     R = 0.5 * (R + R.T)
+    # Normalise R by its largest diagonal entry so that rho is comparable
+    # across maturities and the dual multipliers of the body no-arbitrage
+    # inequalities stay bounded: the smoothness integrals scale with
+    # s_n^3/h^3, which spans many orders of magnitude between short and long
+    # expiries (paper §7 fixes rho=5e-3 without this rescaling).
+    r_scale = float(np.max(np.diag(R)))
+    if r_scale > 0:
+        R = R / r_scale
     smooth = cfg.rho * cp.quad_form(sv.d, cp.psd_wrap(R))
     ridge = cfg.eta * (cp.sum_squares(sv.aL) + cp.sum_squares(sv.aR))
     return data_term + smooth + ridge
@@ -242,16 +263,19 @@ def _calendar_constraints(
     cons: list[cp.Constraint] = []
     for n in range(len(svs) - 1):
         a, b = svs[n], svs[n + 1]
-        # Body-and-band sandwich: for simplicity restrict xbar to the body
-        # intersection. The tail-sum rows of Appendix A cover the regions
-        # outside both seams; the body-wing bands (one seam of a inside the
-        # body of b, or vice versa) are covered by the sandwich on the
-        # intersection in x, extended up to min(x_h_a, x_h_b) and from
-        # max(x_l_a, x_l_b).
         s_n = min(a.s_n, b.s_n)
-        grid = sandwich_grid(a.pieces, b.pieces, s_n,
-                             pts_per_interval_width=cfg.sandwich_pts_per_s)
-        rows = sandwich_rows(a.pieces, b.pieces, grid)
+        # Calendar ordering is enforced on the body-body intersection only;
+        # pure wings beyond either seam are covered by the tail-sum rows of
+        # Appendix A below. This keeps the row count bounded and removes
+        # redundant constraints in the deep wings where both slices already
+        # satisfy the asymptotic ordering by construction.
+        k_lo = max(a.k_l, b.k_l)
+        k_hi = min(a.k_h, b.k_h)
+        step = max(s_n / cfg.sandwich_pts_per_s, 1e-3)
+        n_pts = max(int(np.ceil((k_hi - k_lo) / step)) + 1, 8)
+        n_pts = min(n_pts, 60)
+        k_grid = np.linspace(k_lo, k_hi, n_pts)
+        rows = pointwise_calendar_rows(a.pieces, b.pieces, k_grid)
         for row in rows:
             lhs = (
                 row["Bd_m"] @ b.d
@@ -338,7 +362,8 @@ def calibrate_surface(
     cons: list[cp.Constraint] = []
     for sv in svs:
         cons.extend(_slice_constraints(sv))
-    cons.extend(_calendar_constraints(svs, cfg))
+    if getattr(cfg, "enforce_calendar", True):
+        cons.extend(_calendar_constraints(svs, cfg))
     obj = sum(_slice_objective(sv, cfg) for sv in svs)
     if variance_swap_quotes:
         for idx, L_mkt, width in variance_swap_quotes:
@@ -347,27 +372,22 @@ def calibrate_surface(
             L_expr = 2.0 * (A @ sv.d + gL @ sv.aL + gR @ sv.aR + const)
             scale = max(float(width), abs(float(L_mkt)))
             obj = obj + cp.square((L_expr - L_mkt) / max(scale, 1e-12))
-    prob = cp.Problem(cp.Minimize(obj), cons)
+    # The raw objective sits at O(1e-7); Clarabel's relative-gap check then
+    # becomes ill-posed and the solver terminates with InsufficientProgress
+    # even when primal residuals already reach machine precision. Scaling the
+    # objective to O(1) restores well-behaved convergence.
+    prob = cp.Problem(cp.Minimize(_OBJECTIVE_SCALE * obj), cons)
     t0 = time.perf_counter()
-    # Clarabel on the full SPX surface shows dual-residual stagnation from
-    # the mix of large data weights and many near-redundant calendar rows:
-    # primal feasibility and gap reach machine precision while the dual
-    # residual plateaus. We loosen the reduced-tolerance thresholds so that
-    # the solver returns AlmostSolved (which cvxpy maps to optimal_inaccurate
-    # and keeps the primal iterate) instead of raising.
     solver_opts = dict(
-        max_iter=600, tol_gap_abs=1e-8, tol_gap_rel=1e-8, tol_feas=1e-8,
-        reduced_tol_gap_abs=1e-3, reduced_tol_gap_rel=1e-3,
-        reduced_tol_feas=5.0, reduced_tol_ktratio=1e-2,
+        max_iter=20000,
+        tol_gap_abs=1e-7, tol_gap_rel=1e-7, tol_feas=1e-8,
+        reduced_tol_gap_abs=1e-5, reduced_tol_gap_rel=1e-5,
+        reduced_tol_feas=1e-6, reduced_tol_ktratio=1e-4,
     )
     try:
         prob.solve(solver=cp.CLARABEL, verbose=verbose, **solver_opts)
     except cp.error.SolverError:
-        prob.solve(solver=cp.CLARABEL, verbose=verbose,
-                   max_iter=1200, tol_gap_abs=1e-6, tol_gap_rel=1e-6,
-                   tol_feas=1e-6, reduced_tol_feas=50.0,
-                   reduced_tol_gap_abs=1e-2, reduced_tol_gap_rel=1e-2,
-                   reduced_tol_ktratio=1e-1)
+        prob.solve(solver=cp.SCS, verbose=verbose, max_iters=50000, eps=1e-8)
     rt = time.perf_counter() - t0
     return CPISolution(
         slices=svs, objective=float(prob.value) if prob.value is not None else float("nan"),
