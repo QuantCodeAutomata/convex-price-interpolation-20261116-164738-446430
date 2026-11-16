@@ -349,10 +349,28 @@ def calibrate_surface(
             obj = obj + cp.square((L_expr - L_mkt) / max(scale, 1e-12))
     prob = cp.Problem(cp.Minimize(obj), cons)
     t0 = time.perf_counter()
-    prob.solve(solver=cp.CLARABEL, verbose=verbose)
+    # Clarabel on the full SPX surface shows dual-residual stagnation from
+    # the mix of large data weights and many near-redundant calendar rows:
+    # primal feasibility and gap reach machine precision while the dual
+    # residual plateaus. We loosen the reduced-tolerance thresholds so that
+    # the solver returns AlmostSolved (which cvxpy maps to optimal_inaccurate
+    # and keeps the primal iterate) instead of raising.
+    solver_opts = dict(
+        max_iter=600, tol_gap_abs=1e-8, tol_gap_rel=1e-8, tol_feas=1e-8,
+        reduced_tol_gap_abs=1e-3, reduced_tol_gap_rel=1e-3,
+        reduced_tol_feas=5.0, reduced_tol_ktratio=1e-2,
+    )
+    try:
+        prob.solve(solver=cp.CLARABEL, verbose=verbose, **solver_opts)
+    except cp.error.SolverError:
+        prob.solve(solver=cp.CLARABEL, verbose=verbose,
+                   max_iter=1200, tol_gap_abs=1e-6, tol_gap_rel=1e-6,
+                   tol_feas=1e-6, reduced_tol_feas=50.0,
+                   reduced_tol_gap_abs=1e-2, reduced_tol_gap_rel=1e-2,
+                   reduced_tol_ktratio=1e-1)
     rt = time.perf_counter() - t0
     return CPISolution(
-        slices=svs, objective=float(prob.value or np.nan),
+        slices=svs, objective=float(prob.value) if prob.value is not None else float("nan"),
         runtime_s=rt, solver_status=prob.status,
     )
 

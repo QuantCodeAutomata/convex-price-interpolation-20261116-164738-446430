@@ -1,0 +1,19 @@
+{
+  "paper_source": "Cboe SPX/SPXW delayed-quote snapshot, 2 Nov 2026 17:05 ET",
+  "data_source_used": "synthetic SSVI surface",
+  "n_slices": 55,
+  "n_quotes_total": 11690,
+  "n_in_spread": 2911,
+  "frac_in_spread": 0.24901625320786996,
+  "median_outside_bps": 287.88317894104995,
+  "median_dist_from_mid_bps": 161.95705832284642,
+  "runtime_s": 38.60983974499982,
+  "solver_status": "optimal_inaccurate",
+  "calendar": {
+    "violations": 389502,
+    "max_gap": -0.018044535821117202,
+    "n_pairs": 54,
+    "n_points": 40000
+  },
+  "reduced": false
+}
